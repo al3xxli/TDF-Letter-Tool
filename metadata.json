@@ -1,0 +1,7 @@
+{
+  "name": "Professor Letter & Email Assistant",
+  "description": "An informational academic peer assistant adapting across all professors and student scenarios, providing high-level guidance, interactive mind maps, and structured letters.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
