@@ -1,4 +1,4 @@
-import angular from '@analogjs/vite-plugin-angular';
+import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'path';
 import { defineConfig } from 'vite';
@@ -6,9 +6,7 @@ import { defineConfig } from 'vite';
 export default defineConfig(() => {
   return {
     plugins: [
-      angular({
-        tsconfig: path.resolve(__dirname, 'tsconfig.app.json'),
-      }),
+      react(),
       tailwindcss(),
     ],
     resolve: {

@@ -11,26 +11,94 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Initialize Gemini Client
-const apiKey = process.env.GEMINI_API_KEY || '';
-const ai = apiKey
-  ? new GoogleGenAI({
-      apiKey,
+// Normalization middleware to support Vercel serverless functions where /api may or may not be stripped
+app.use((req, res, next) => {
+  if (
+    !req.url.startsWith('/api') &&
+    !req.url.startsWith('/@') &&
+    !req.url.startsWith('/src') &&
+    !req.url.startsWith('/node_modules') &&
+    !req.url.includes('.') &&
+    req.url !== '/'
+  ) {
+    req.url = `/api${req.url.startsWith('/') ? '' : '/'}${req.url}`;
+  }
+  next();
+});
+
+// Helper to extract user-provided Gemini API key (BYOK architecture)
+function getGenAIClient(req: express.Request): { client: GoogleGenAI | null; error?: string } {
+  const headerKey = req.headers['x-gemini-api-key'];
+  const userKey =
+    (typeof headerKey === 'string' && headerKey.trim())
+      ? headerKey.trim()
+      : (req.body && typeof req.body.apiKey === 'string' && req.body.apiKey.trim())
+      ? req.body.apiKey.trim()
+      : (process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : '');
+
+  if (!userKey) {
+    return {
+      client: null,
+      error: 'Gemini API key is required. Please provide your API key in the application interface.',
+    };
+  }
+
+  try {
+    const client = new GoogleGenAI({
+      apiKey: userKey,
       httpOptions: {
         headers: {
           'User-Agent': 'aistudio-build',
         },
       },
-    })
-  : null;
+    });
+    return { client };
+  } catch (err: any) {
+    return {
+      client: null,
+      error: err?.message || 'Failed to initialize Gemini API client with provided key.',
+    };
+  }
+}
 
 // API routes
 app.get('/api/health', (req, res) => {
+  const headerKey = req.headers['x-gemini-api-key'];
+  const userKey = typeof headerKey === 'string' ? headerKey.trim() : '';
   res.json({
     status: 'ok',
-    hasApiKey: Boolean(apiKey),
+    byokArchitecture: true,
+    hasClientKey: Boolean(userKey),
     timestamp: new Date().toISOString(),
   });
+});
+
+// Validate user API key endpoint
+app.post('/api/validate-key', async (req, res) => {
+  const { client, error } = getGenAIClient(req);
+  if (!client) {
+    return res.status(401).json({ valid: false, error: error || 'API key required.' });
+  }
+
+  try {
+    const response = await client.models.generateContent({
+      model: 'gemini-3.1-flash-lite',
+      contents: 'Respond with OK',
+      config: { maxOutputTokens: 5 },
+    });
+    if (response.text) {
+      return res.json({ valid: true });
+    }
+    return res.json({ valid: true });
+  } catch (err: any) {
+    const msg = err?.message || '';
+    return res.status(400).json({
+      valid: false,
+      error: msg.includes('API key') || msg.includes('PERMISSION_DENIED') || msg.includes('UNAUTHENTICATED')
+        ? 'Invalid API key. Please verify your key on Google AI Studio.'
+        : (msg || 'Validation failed. Check your API key.'),
+    });
+  }
 });
 
 function getAcademicFallback(scenario: string, course: any, student: any, data: any) {
@@ -116,8 +184,9 @@ function getAcademicFallback(scenario: string, course: any, student: any, data: 
 // Generate letter
 app.post('/api/generate', async (req, res) => {
   const { scenario, course, student, data, tone, customInstructions } = req.body;
+  const { client } = getGenAIClient(req);
 
-  if (!ai) {
+  if (!client) {
     return res.json({
       success: true,
       letter: getAcademicFallback(scenario, course, student, data),
@@ -160,7 +229,7 @@ Generate structured JSON output with:
 
   for (const modelName of modelsToTry) {
     try {
-      const response = await ai.models.generateContent({
+      const response = await client.models.generateContent({
         model: modelName,
         contents: userPrompt,
         config: {
@@ -236,11 +305,13 @@ Generate structured JSON output with:
 app.post('/api/refine', async (req, res) => {
   try {
     const { action, currentBody, currentSubject, course, student } = req.body;
+    const { client, error: keyError } = getGenAIClient(req);
 
-    if (!ai) {
-      return res.status(200).json({
+    if (!client) {
+      return res.status(401).json({
         fallback: true,
-        message: 'No Gemini API key, edit locally.',
+        requiresKey: true,
+        message: keyError || 'Gemini API key is required to refine drafts.',
       });
     }
 
@@ -281,7 +352,7 @@ Respond with JSON:
 
     for (const modelName of modelsToTry) {
       try {
-        const response = await ai.models.generateContent({
+        const response = await client.models.generateContent({
           model: modelName,
           contents: prompt,
           config: {
@@ -331,11 +402,13 @@ Respond with JSON:
 app.post('/api/critique', async (req, res) => {
   try {
     const { draftText, subject } = req.body;
+    const { client, error: keyError } = getGenAIClient(req);
 
-    if (!ai) {
-      return res.status(200).json({
+    if (!client) {
+      return res.status(401).json({
         fallback: true,
-        message: 'AI draft critique requires active API key.',
+        requiresKey: true,
+        message: keyError || 'Gemini API key is required to audit drafts.',
       });
     }
 
@@ -364,7 +437,7 @@ Return JSON:
 
     for (const modelName of modelsToTry) {
       try {
-        const response = await ai.models.generateContent({
+        const response = await client.models.generateContent({
           model: modelName,
           contents: prompt,
           config: {
@@ -547,19 +620,13 @@ app.post('/api/peer/chat', async (req, res) => {
     const style = professorStyle || 'direct_systems';
     const scenario = useCase || 'sickness_absence';
 
-    if (!ai) {
-      return res.json({
-        success: true,
-        reply: getPeerFallbackResponse(step, {
-          initialAsk,
-          additionalInfo: additionalInformation,
-          userMessage,
-          professorName: prof,
-          courseCode: course,
-          professorStyle: style,
-          useCase: scenario,
-        }),
-        step,
+    const { client, error: keyError } = getGenAIClient(req);
+
+    if (!client) {
+      return res.status(401).json({
+        success: false,
+        requiresKey: true,
+        error: keyError || 'A Gemini API key is required. Please enter your key in the assistant header.',
       });
     }
 
@@ -615,7 +682,7 @@ Remember: Respond in a SINGLE SHORT PARAGRAPH only. Do not address anyone by nam
 
     for (const modelName of modelsToTry) {
       try {
-        const response = await ai.models.generateContent({
+        const response = await client.models.generateContent({
           model: modelName,
           contents: userPrompt,
           config: {
@@ -684,7 +751,9 @@ app.post('/api/peer/organized-output', async (req, res) => {
     const scenario = useCase || 'sickness_absence';
     const extra = symptoms || additionalInformation || 'Current academic situation';
 
-    if (ai) {
+    const { client, error: keyError } = getGenAIClient(req);
+
+    if (client) {
       const prompt = `You are an expert academic advisor generating a structured feedback response for a student communicating with a professor.
 Target Professor: ${prof}
 Course: ${course}
@@ -719,7 +788,7 @@ Generate a JSON object matching this schema:
 
       for (const modelName of modelsToTry) {
         try {
-          const response = await ai.models.generateContent({
+          const response = await client.models.generateContent({
             model: modelName,
             contents: prompt,
             config: {
@@ -866,6 +935,23 @@ Generate a JSON object matching this schema:
   }
 });
 
+// Route compatibility aliases
+app.post('/api/peer-guidance', (req, res, next) => {
+  req.url = '/api/peer/chat';
+  req.body = { ...req.body, step: 1 };
+  (app as any)._router.handle(req, res, next);
+});
+
+app.post('/api/peer-chat', (req, res, next) => {
+  req.url = '/api/peer/chat';
+  (app as any)._router.handle(req, res, next);
+});
+
+app.post('/api/generate-letter', (req, res, next) => {
+  req.url = '/api/peer/organized-output';
+  (app as any)._router.handle(req, res, next);
+});
+
 
 // Vite middleware for development & static serving for production
 async function startServer() {
@@ -888,4 +974,8 @@ async function startServer() {
   });
 }
 
-startServer();
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;
